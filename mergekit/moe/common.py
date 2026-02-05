@@ -101,3 +101,51 @@ def copy_tensor_out(
         tensor.to(dtype=out_dtype),
         clone=clone,
     )
+
+def fuse_moe_ct_weights(
+    base: torch.Tensor, 
+    expert: torch.Tensor, 
+    alpha: float
+) -> torch.Tensor:
+    """
+    Residual-Expert Fusion (MoE-CT).
+    Combines the original dense knowledge (Stability) with new experts (Plasticity).
+    """
+    if base.shape != expert.shape:
+        raise ValueError(f"Shape mismatch: Base {base.shape} vs Expert {expert.shape}")
+    
+    # lerp: out = start + weight * (end - start)
+    # We compute in float32 for high-precision blending, then cast back
+    res = torch.lerp(base.to(torch.float32), expert.to(torch.float32), alpha)
+    return res.to(base.dtype)
+
+
+def get_moe_ct_alpha(
+    layer_idx: int, 
+    total_layers: int, 
+    base_alpha: float, 
+    strategy: str = "constant"
+) -> float:
+    """
+    Calculates the alpha (plasticity) value for a specific layer.
+    
+    Strategies:
+    - 'constant': Uses base_alpha for all layers.
+    - 'linear_increase': Plasticity increases with depth (higher layers learn more).
+    - 'linear_decrease': Stability increases with depth (higher layers stay frozen).
+    """
+    if strategy == "constant":
+        return base_alpha
+    
+    # Normalized depth (0.0 to 1.0)
+    depth = layer_idx / (total_layers - 1)
+    
+    if strategy == "linear_increase":
+        # Early layers are stable, late layers are plastic
+        return base_alpha * depth
+    
+    if strategy == "linear_decrease":
+        # Early layers are plastic, late layers are stable (Recommended)
+        return base_alpha * (1.0 - depth)
+    
+    return base_alpha

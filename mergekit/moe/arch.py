@@ -39,3 +39,21 @@ class MoEOutputArchitecture(ABC):
     ):
         """Write the config and tensors for the output MoE to the given path."""
         pass
+
+
+def get_moe_architecture(config: MoEMergeConfig) -> MoEOutputArchitecture:
+    """
+    Factory to return the correct architecture implementation.
+    """
+    # Force Qwen3 architecture if requested or if ultra-high sparsity is needed
+    if config.architecture == "qwen3":
+        from mergekit.moe.qwen3 import Qwen3Architecture
+        return Qwen3Architecture()
+    
+    # Standard Qwen2/2.5 logic
+    if config.architecture == "qwen2":
+        from mergekit.moe.qwen import Qwen2Architecture
+        return Qwen2Architecture()
+
+    # ... other architectures ...
+    raise ValueError(f"Unknown architecture: {config.architecture}")
