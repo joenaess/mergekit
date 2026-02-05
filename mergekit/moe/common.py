@@ -153,14 +153,11 @@ def fuse_gate_weights(
     base_weight: float = 1.0
 ) -> torch.Tensor:
     """
-    Adjusts router logits to favor the base model's knowledge.
+    Adjusts router logits to stabilize expert selection.
     
-    base_weight > 1.0: Router is biased towards 'Stability' (original FFN).
-    base_weight < 1.0: Router is biased towards 'Plasticity' (new Experts).
+    A base_weight > 1.0 increases the probability that the router 
+    selects experts with high 'Stability' (original model influence).
     """
-    # In MoE architectures like Qwen, the gate is a Linear layer (num_experts, hidden_size)
-    # apply the weight to the rows corresponding to the 'shared' or 'anchor' experts
-    modified_gates = expert_gates.clone()
-    # If using a shared expert (index 0 or separate), scale its selection probability
-    modified_gates *= base_weight
-    return modified_gates
+    # Simply scaling the logits is a robust way to bias the Top-K selection
+    # without breaking the gradient flow for future fine-tuning.
+    return expert_gates * base_weight
