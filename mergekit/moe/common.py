@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import tqdm
 import transformers
+import math
 
 from mergekit.architecture import WeightInfo
 from mergekit.common import ModelReference, dtype_from_name
@@ -126,26 +127,40 @@ def get_moe_ct_alpha(
     base_alpha: float, 
     strategy: str = "constant"
 ) -> float:
-    """
-    Calculates the alpha (plasticity) value for a specific layer.
+    denom = max(1, total_layers - 1)
+    depth = layer_idx / denom
     
-    Strategies:
-    - 'constant': Uses base_alpha for all layers.
-    - 'linear_increase': Plasticity increases with depth (higher layers learn more).
-    - 'linear_decrease': Stability increases with depth (higher layers stay frozen).
-    """
     if strategy == "constant":
         return base_alpha
-    
-    # Normalized depth (0.0 to 1.0)
-    depth = layer_idx / (total_layers - 1)
-    
-    if strategy == "linear_increase":
-        # Early layers are stable, late layers are plastic
+    elif strategy == "linear_increase":
         return base_alpha * depth
-    
-    if strategy == "linear_decrease":
-        # Early layers are plastic, late layers are stable (Recommended)
+    elif strategy == "linear_decrease":
         return base_alpha * (1.0 - depth)
     
+    # NEW: U-Shaped Strategy
+    elif strategy == "u_shaped":
+        # Uses a cosine-based curve to dip in the middle
+        # Alpha is high at depth 0.0 and 1.0, and low at 0.5
+        curve = 0.5 * (1 + math.cos(2 * math.pi * depth))
+        return base_alpha * curve
+    
     return base_alpha
+
+
+def fuse_gate_weights(
+    base_gate: torch.Tensor, 
+    expert_gates: torch.Tensor, 
+    base_weight: float = 1.0
+) -> torch.Tensor:
+    """
+    Adjusts router logits to favor the base model's knowledge.
+    
+    base_weight > 1.0: Router is biased towards 'Stability' (original FFN).
+    base_weight < 1.0: Router is biased towards 'Plasticity' (new Experts).
+    """
+    # In MoE architectures like Qwen, the gate is a Linear layer (num_experts, hidden_size)
+    # apply the weight to the rows corresponding to the 'shared' or 'anchor' experts
+    modified_gates = expert_gates.clone()
+    # If using a shared expert (index 0 or separate), scale its selection probability
+    modified_gates *= base_weight
+    return modified_gates

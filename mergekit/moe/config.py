@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from pydantic import BaseModel
 

@@ -14,7 +14,7 @@ from mergekit.moe.arch import MoEOutputArchitecture
 from mergekit.moe.common import copy_tensor_out, initialize_io, select_dtype
 from mergekit.moe.config import MoEMergeConfig
 from mergekit.options import MergeOptions
-from mergekit.moe.common import fuse_moe_ct_weights
+from mergekit.moe.common import fuse_moe_ct_weights, get_moe_ct_alpha
 
 QWEN3_INFO = NAME_TO_ARCH["Qwen3ForCausalLM"][0]
 
@@ -89,34 +89,75 @@ class Qwen3MoE(MoEOutputArchitecture):
         out_cfg.save_pretrained(out_path)
 
         loaders, base_loader, writer = initialize_io(config, out_path, merge_options)
-        for weight_info in tqdm.tqdm(QWEN3_INFO.all_weights(base_cfg), desc="Weights"):
+        
+        for weight_info in tqdm.tqdm(
+            QWEN3_INFO.all_weights(base_cfg),
+            desc="Weights",
+        ):
             tensor_name = weight_info.name
+            
+            # 1. DYNAMIC ALPHA CALCULATION
+            # Extract layer index to apply the U-shaped scaling strategy
+            layer_idx = 0
+            if "layers." in tensor_name:
+                layer_idx = int(tensor_name.split("layers.")[1].split(".")[0])
+
             if ".mlp." in tensor_name:
+                # Load base FFN as the 'Stability Anchor'
                 base_ffn_tensor = None
+                current_alpha = config.base_alpha
+                
                 if getattr(config, "moe_ct_mode", False):
                     base_ffn_tensor = base_loader.get_tensor(tensor_name)
+                    # Calculate dynamic alpha based on layer depth
+                    from mergekit.moe.common import get_moe_ct_alpha, fuse_moe_ct_weights
+                    current_alpha = get_moe_ct_alpha(
+                        layer_idx=layer_idx,
+                        total_layers=config.num_layers,
+                        base_alpha=config.base_alpha,
+                        strategy=getattr(config, "alpha_strategy", "constant")
+                    )
 
                 for expert_idx, expert in enumerate(config.experts):
-                    expert_name = tensor_name.replace(".mlp.", f".mlp.experts.{expert_idx}.")
-                    expert_loader = loaders.get(expert.source_model)
-
-                    if base_ffn_tensor is not None:
-                        # Fuse base logic into the 128 specialized experts
-                        expert_tensor = expert_loader.get_tensor(weight_info.name)
-                        fused = fuse_moe_ct_weights(base_ffn_tensor, expert_tensor, config.base_alpha)
-                        writer.save_tensor(expert_name, fused.to(dtype=out_dtype), clone=merge_options.clone_tensors)
-                    else:
-                        copy_tensor_out(weight_info, expert_loader, writer, expert=expert, output_name=expert_name, out_dtype=out_dtype)
-            else:
-                # Handle Non-MLP weights (Attention, LayerNorms, Embeddings)
-                try:
-                    tensor = base_loader.get_tensor(
-                        tensor_name, aliases=weight_info.aliases
+                    expert_name = tensor_name.replace(
+                        ".mlp.", f".mlp.experts.{expert_idx}."
                     )
-                except KeyError:
-                    if weight_info.optional:
-                        continue
-                    raise
+                    expert_loader = loaders.get(expert.source_model)
+                    
+                    if base_ffn_tensor is not None:
+                        # NEW: Residual-Expert Fusion
+                        expert_tensor = expert_loader.get_tensor(weight_info.name)
+                        fused_tensor = fuse_moe_ct_weights(
+                            base_ffn_tensor, 
+                            expert_tensor, 
+                            current_alpha
+                        )
+                        writer.save_tensor(
+                            expert_name,
+                            fused_tensor.to(dtype=out_dtype),
+                            clone=merge_options.clone_tensors,
+                        )
+                    else:
+                        # Fallback for standard merges
+                        copy_tensor_out(
+                            weight_info,
+                            expert_loader,
+                            writer,
+                            expert=expert,
+                            is_residual="down_proj" in tensor_name,
+                            output_name=expert_name,
+                            out_dtype=out_dtype,
+                            clone=merge_options.clone_tensors,
+                        )
+            else:
+                # Standard non-MLP weight processing
+                tensor = base_loader.get_tensor(
+                    tensor_name,
+                    aliases=weight_info.aliases,
+                    raise_on_missing=not weight_info.optional,
+                )
+                if tensor is None:
+                    continue
 
                 writer.save_tensor(
                     tensor_name,
