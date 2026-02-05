@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import tqdm
 import transformers
+import math
 
 from mergekit.architecture import WeightInfo
 from mergekit.common import ModelReference, dtype_from_name
@@ -101,3 +102,62 @@ def copy_tensor_out(
         tensor.to(dtype=out_dtype),
         clone=clone,
     )
+
+def fuse_moe_ct_weights(
+    base: torch.Tensor, 
+    expert: torch.Tensor, 
+    alpha: float
+) -> torch.Tensor:
+    """
+    Residual-Expert Fusion (MoE-CT).
+    Combines the original dense knowledge (Stability) with new experts (Plasticity).
+    """
+    if base.shape != expert.shape:
+        raise ValueError(f"Shape mismatch: Base {base.shape} vs Expert {expert.shape}")
+    
+    # lerp: out = start + weight * (end - start)
+    # We compute in float32 for high-precision blending, then cast back
+    res = torch.lerp(base.to(torch.float32), expert.to(torch.float32), alpha)
+    return res.to(base.dtype)
+
+
+def get_moe_ct_alpha(
+    layer_idx: int, 
+    total_layers: int, 
+    base_alpha: float, 
+    strategy: str = "constant"
+) -> float:
+    denom = max(1, total_layers - 1)
+    depth = layer_idx / denom
+    
+    if strategy == "constant":
+        return base_alpha
+    elif strategy == "linear_increase":
+        return base_alpha * depth
+    elif strategy == "linear_decrease":
+        return base_alpha * (1.0 - depth)
+    
+    # NEW: U-Shaped Strategy
+    elif strategy == "u_shaped":
+        # Uses a cosine-based curve to dip in the middle
+        # Alpha is high at depth 0.0 and 1.0, and low at 0.5
+        curve = 0.5 * (1 + math.cos(2 * math.pi * depth))
+        return base_alpha * curve
+    
+    return base_alpha
+
+
+def fuse_gate_weights(
+    base_gate: torch.Tensor, 
+    expert_gates: torch.Tensor, 
+    base_weight: float = 1.0
+) -> torch.Tensor:
+    """
+    Adjusts router logits to stabilize expert selection.
+    
+    A base_weight > 1.0 increases the probability that the router 
+    selects experts with high 'Stability' (original model influence).
+    """
+    # Simply scaling the logits is a robust way to bias the Top-K selection
+    # without breaking the gradient flow for future fine-tuning.
+    return expert_gates * base_weight

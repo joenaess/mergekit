@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 
 import logging
-from typing import List, Optional, Literal  # Ensure Literal is imported
+from typing import List, Optional, Literal
 
 from pydantic import BaseModel
 
@@ -51,6 +51,10 @@ class MoEMergeConfig(BaseModel):
     experts_per_token: int = 2
     shared_experts: Optional[List[Expert]] = None
     architecture: Optional[str] = None
+    moe_ct_mode: bool = False  # Flag for MoE-CT behavior
+    base_alpha: float = 0.5    # The weight of the original FFN in the fusion
+    alpha_strategy: Literal["constant", "linear_increase", "linear_decrease"] = "constant"
+    router_aux_scale: float = 1.1  # Multiplier for the router auxiliary loss, if applicable
 
 
 def is_bad_config(config: MoEMergeConfig, allow_all_same: bool = False) -> bool:

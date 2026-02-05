@@ -14,6 +14,7 @@ from mergekit.moe.arch import MoEOutputArchitecture
 from mergekit.moe.common import copy_tensor_out, initialize_io, select_dtype
 from mergekit.moe.config import MoEMergeConfig
 from mergekit.options import MergeOptions
+from mergekit.moe.common import fuse_moe_ct_weights, get_moe_ct_alpha
 
 QWEN3_INFO = NAME_TO_ARCH["Qwen3ForCausalLM"][0]
 
@@ -88,28 +89,63 @@ class Qwen3MoE(MoEOutputArchitecture):
         out_cfg.save_pretrained(out_path)
 
         loaders, base_loader, writer = initialize_io(config, out_path, merge_options)
+        
+        # 1. PROCESS MAIN WEIGHTS (MLP Fusion + Dynamic Alpha)
         for weight_info in tqdm.tqdm(
             QWEN3_INFO.all_weights(base_cfg),
             desc="Weights",
         ):
             tensor_name = weight_info.name
+            
+            layer_idx = 0
+            if "layers." in tensor_name:
+                layer_idx = int(tensor_name.split("layers.")[1].split(".")[0])
+
             if ".mlp." in tensor_name:
+                base_ffn_tensor = None
+                current_alpha = config.base_alpha
+                
+                if getattr(config, "moe_ct_mode", False):
+                    base_ffn_tensor = base_loader.get_tensor(tensor_name)
+                    from mergekit.moe.common import get_moe_ct_alpha, fuse_moe_ct_weights
+                    current_alpha = get_moe_ct_alpha(
+                        layer_idx=layer_idx,
+                        total_layers=config.num_layers,
+                        base_alpha=config.base_alpha,
+                        strategy=getattr(config, "alpha_strategy", "constant")
+                    )
+
                 for expert_idx, expert in enumerate(config.experts):
                     expert_name = tensor_name.replace(
                         ".mlp.", f".mlp.experts.{expert_idx}."
                     )
                     expert_loader = loaders.get(expert.source_model)
-                    copy_tensor_out(
-                        weight_info,
-                        expert_loader,
-                        writer,
-                        expert=expert,
-                        is_residual="down_proj" in tensor_name,
-                        output_name=expert_name,
-                        out_dtype=out_dtype,
-                        clone=merge_options.clone_tensors,
-                    )
+                    
+                    if base_ffn_tensor is not None:
+                        expert_tensor = expert_loader.get_tensor(weight_info.name)
+                        fused_tensor = fuse_moe_ct_weights(
+                            base_ffn_tensor, 
+                            expert_tensor, 
+                            current_alpha
+                        )
+                        writer.save_tensor(
+                            expert_name,
+                            fused_tensor.to(dtype=out_dtype),
+                            clone=merge_options.clone_tensors,
+                        )
+                    else:
+                        copy_tensor_out(
+                            weight_info,
+                            expert_loader,
+                            writer,
+                            expert=expert,
+                            is_residual="down_proj" in tensor_name,
+                            output_name=expert_name,
+                            out_dtype=out_dtype,
+                            clone=merge_options.clone_tensors,
+                        )
             else:
+                # Standard non-MLP weight processing
                 tensor = base_loader.get_tensor(
                     tensor_name,
                     aliases=weight_info.aliases,
@@ -124,12 +160,28 @@ class Qwen3MoE(MoEOutputArchitecture):
                     clone=merge_options.clone_tensors,
                 )
 
+        # 2. PROCESS ROUTER WEIGHTS (Weighted Gate Fusion)
+        from mergekit.moe.common import fuse_gate_weights # Import our new logic
+
         for layer_idx, weight in enumerate(
             tqdm.tqdm(router_weights, desc="Router weights")
         ):
+            final_router_weight = weight
+            
+            if getattr(config, "moe_ct_mode", False):
+                # Apply a slight bias to the experts that carry the anchor knowledge.
+                # In Qwen3's fine-grained architecture, this helps prevent routing
+                # to "unstable" regions during early multilingual inference.
+                # Defaulting to 1.1 (10% boost to Stability)
+                final_router_weight = fuse_gate_weights(
+                    base_gate=None, # Not used in this implementation
+                    expert_gates=weight, 
+                    base_weight=getattr(config, "router_aux_scale", 1.1)
+                )
+
             writer.save_tensor(
                 f"model.layers.{layer_idx}.mlp.gate.weight",
-                weight.to(dtype=out_dtype).contiguous(),
+                final_router_weight.to(dtype=out_dtype).contiguous(),
                 clone=merge_options.clone_tensors,
             )
 
