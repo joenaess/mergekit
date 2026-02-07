@@ -81,6 +81,7 @@ def get_gate_params(
 ):
     gate_vecs = []
     _do_it = None
+    print(f"DEBUG: get_gate_params called with mode='{mode}', num_experts={len(experts)}")
 
     model_cfg = model_ref.config(trust_remote_code=trust_remote_code)
 
