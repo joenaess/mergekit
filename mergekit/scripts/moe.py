@@ -14,6 +14,7 @@ from mergekit.merge import MergeOptions
 from mergekit.moe import ALL_OUTPUT_ARCHITECTURES, MoEOutputArchitecture
 from mergekit.moe.config import MoEMergeConfig, is_bad_config
 from mergekit.moe.router import get_gate_params, warn_degenerate_gates
+from mergekit.moe.common import fuse_gate_weights
 from mergekit.options import PrettyPrintHelp, add_merge_options
 
 
@@ -65,6 +66,21 @@ def build(
     # gate_vecs: (num_layers, num_experts, hidden_size)
     router_weights = gate_vecs[:, : len(config.experts), :]
     shared_router_weights = gate_vecs[:, len(config.experts) :, :]
+    
+    # NEW: Apply Router Boost (MoE-CT)
+    if config.router_aux_scale != 1.0:
+        logging.info(f"Applying Router Boost: scale={config.router_aux_scale}")
+        # Note: fuse_gate_weights simply multiplies by scalar, logic in common.py
+        # We assume base_gate isn't needed or is implicit in the boost logic described
+        # Wait, the signature is fuse_gate_weights(base_gate, expert_gates, base_weight)
+        # But looking at common.py: return expert_gates * base_weight
+        # So we can just pass anything as base_gate or treat it as in-place if we only care about scaling
+        # Actually, let's look at the signature again:
+        # def fuse_gate_weights(base_gate, expert_gates, base_weight): return expert_gates * base_weight
+        # It ignores base_gate completely! So we can pass None or dummy.
+        router_weights = fuse_gate_weights(None, router_weights, config.router_aux_scale)
+        if shared_router_weights.numel() > 0:
+             shared_router_weights = fuse_gate_weights(None, shared_router_weights, config.router_aux_scale)
     warn_degenerate_gates(gate_vecs)
 
     out_arch.write_model(

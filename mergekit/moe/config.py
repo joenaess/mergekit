@@ -53,7 +53,7 @@ class MoEMergeConfig(BaseModel):
     architecture: Optional[str] = None
     moe_ct_mode: bool = False  # Flag for MoE-CT behavior
     base_alpha: float = 0.5    # The weight of the original FFN in the fusion
-    alpha_strategy: Literal["constant", "linear_increase", "linear_decrease"] = "constant"
+    alpha_strategy: Literal["constant", "linear_increase", "linear_decrease", "u_shaped"] = "constant"
     router_aux_scale: float = 1.1  # Multiplier for the router auxiliary loss, if applicable
 
 

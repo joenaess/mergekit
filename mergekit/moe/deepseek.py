@@ -12,7 +12,7 @@ import transformers
 
 from mergekit.architecture import arch_info_for_config
 from mergekit.moe.arch import MoEOutputArchitecture
-from mergekit.moe.common import copy_tensor_out, initialize_io, select_dtype
+from mergekit.moe.common import copy_tensor_out, initialize_io, select_dtype, fuse_moe_ct_weights
 from mergekit.moe.config import MoEMergeConfig
 from mergekit.options import MergeOptions
 
@@ -131,35 +131,50 @@ class DeepseekMoE(MoEOutputArchitecture):
         ):
             tensor_name = weight_info.name
             if ".mlp." in tensor_name:
+                # Load base FFN for fusion
+                base_ffn_tensor = None
+                if getattr(config, "moe_ct_mode", False):
+                    base_ffn_tensor = base_loader.get_tensor(tensor_name)
+
                 for expert_idx, expert in enumerate(config.experts):
                     expert_name = tensor_name.replace(
                         ".mlp.", f".mlp.experts.{expert_idx}."
                     )
                     expert_loader = loaders.get(expert.source_model)
-                    copy_tensor_out(
-                        weight_info,
-                        expert_loader,
-                        writer,
-                        expert=expert,
-                        is_residual="down_proj" in tensor_name,
-                        output_name=expert_name,
-                        out_dtype=out_dtype,
-                        clone=merge_options.clone_tensors,
-                    )
+                    
+                    if base_ffn_tensor is not None:
+                         # MoE-CT Fusion
+                        expert_tensor = expert_loader.get_tensor(weight_info.name)
+                        fused = fuse_moe_ct_weights(base_ffn_tensor, expert_tensor, config.base_alpha)
+                        writer.save_tensor(expert_name, fused.to(dtype=out_dtype), clone=merge_options.clone_tensors)
+                    else:
+                        copy_tensor_out(
+                            weight_info,
+                            expert_loader,
+                            writer,
+                            expert=expert,
+                            is_residual="down_proj" in tensor_name,
+                            output_name=expert_name,
+                            out_dtype=out_dtype,
+                            clone=merge_options.clone_tensors,
+                        )
 
                 if shared_def is not None:
-                    copy_tensor_out(
-                        weight_info,
-                        shared_loader,
-                        writer,
-                        expert=shared_def,
-                        is_residual="down_proj" in tensor_name,
-                        output_name=tensor_name.replace(
-                            ".mlp.", ".mlp.shared_experts."
-                        ),
-                        out_dtype=out_dtype,
-                        clone=merge_options.clone_tensors,
-                    )
+                    shared_out_name = tensor_name.replace(".mlp.", ".mlp.shared_experts.")
+                    if base_ffn_tensor is not None:
+                        # MoE-CT: Anchor the shared expert to the original dense weights
+                        writer.save_tensor(shared_out_name, base_ffn_tensor.to(dtype=out_dtype), clone=merge_options.clone_tensors)
+                    else:
+                        copy_tensor_out(
+                            weight_info,
+                            shared_loader,
+                            writer,
+                            expert=shared_def,
+                            is_residual="down_proj" in tensor_name,
+                            output_name=shared_out_name,
+                            out_dtype=out_dtype,
+                            clone=merge_options.clone_tensors,
+                        )
             else:
                 copy_tensor_out(
                     weight_info,
